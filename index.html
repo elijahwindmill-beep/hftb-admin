@@ -62,7 +62,13 @@
   .pill.live { background: var(--green-soft); color: var(--green); }
   .pill.hidden { background: var(--line); color: var(--slate); }
   .pill.test { background: var(--amber-soft); color: #92400E; }
-  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .pill.test { color: var(--amber); } }
+  .pill.draft { background: var(--accent-soft); color: var(--accent); }
+  .pill.sched { background: var(--amber-soft); color: #92400E; }
+  .filters { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+  .filters button { padding: 6px 12px; font-size: 14px; background: transparent; color: var(--slate); border-color: var(--line); }
+  .filters button.on { background: var(--ink); color: var(--card); border-color: var(--ink); }
+  .note { background: var(--accent-soft); color: var(--ink); border-radius: 12px; padding: 10px 12px; font-size: 14px; margin: 0 0 8px; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .pill.test, :root:not([data-theme="light"]) .pill.sched { color: var(--amber); } }
   .post .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
   .post .actions button { padding: 6px 10px; font-size: 14px; }
   .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%);
@@ -133,7 +139,17 @@
     <textarea id="bodyUk"></textarea>
     <p class="hint">Donors with the app set to Ukrainian see this version. If it's empty, they see the English one.</p>
 
-    <label class="check"><input id="published" type="checkbox" checked> Show in the app now</label>
+    <p class="note" id="draftNote" hidden>Claude wrote this draft. Read both languages, change anything, then choose when it goes live and save.</p>
+    <label for="when">When it shows in the app</label>
+    <div class="two">
+      <select id="when">
+        <option value="now">Now</option>
+        <option value="later">At a set time</option>
+        <option value="hidden">Not yet (keep hidden)</option>
+      </select>
+      <input id="at" type="datetime-local" hidden>
+    </div>
+    <p class="hint" id="atHint" hidden>Your computer's time zone. The post appears in the app by itself at that time.</p>
     <label class="check"><input id="isTest" type="checkbox" checked> Test post (shows a TEST label in this list)</label>
 
     <div class="row" style="margin-top:16px">
@@ -144,7 +160,11 @@
 
   <!-- List -->
   <section id="list" class="card" hidden>
-    <div class="row"><h2 class="grow">Posts in the app</h2><button class="ghost" id="reload" style="padding:6px 12px;font-size:14px">Refresh</button></div>
+    <div class="row"><h2 class="grow">Posts</h2><button class="ghost" id="reload" style="padding:6px 12px;font-size:14px">Refresh</button></div>
+    <div class="filters" id="filters">
+      <button data-f="review">To review</button><button data-f="sched">Scheduled</button>
+      <button data-f="live">In the app</button><button data-f="hidden">Hidden</button><button data-f="all" class="on">All</button>
+    </div>
     <div id="posts"></div>
   </section>
 </main>
@@ -159,7 +179,20 @@ const BUCKET = "news-images";
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: true, detectSessionInUrl: true, flowType: "implicit" } });
 const $ = (id) => document.getElementById(id);
-let editingId = null, photoUrl = null, photoFile = null, toastT;
+let editingId = null, photoUrl = null, photoFile = null, toastT, filter = "all", editingState = null;
+
+// A post is one of: review (Claude's draft, not approved), hidden, sched (approved, time not reached), live.
+function stateOf(p) {
+  if (!p.published) return p.source === "claude" ? "review" : "hidden";
+  return new Date(p.publish_at) > new Date() ? "sched" : "live";
+}
+const fmt = (d) => new Date(d).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+function toLocalInput(d) { const x = new Date(d); x.setMinutes(x.getMinutes() - x.getTimezoneOffset()); return x.toISOString().slice(0, 16); }
+function syncWhen() { const later = $("when").value === "later"; $("at").hidden = !later; $("atHint").hidden = !later;
+  if (later && !$("at").value) { const t = new Date(Date.now() + 864e5); t.setHours(9, 0, 0, 0); $("at").value = toLocalInput(t); } }
+$("when").onchange = syncWhen;
+document.querySelectorAll("#filters button").forEach(b => b.onclick = () => {
+  filter = b.dataset.f; document.querySelectorAll("#filters button").forEach(x => x.classList.toggle("on", x === b)); loadPosts(); });
 
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("on"), 3200); }
 function show(ids) { for (const id of ["signIn","notAdmin","editor","list"]) $(id).hidden = !ids.includes(id); }
@@ -190,24 +223,32 @@ $("signOut").onclick = async () => { await sb.auth.signOut(); refreshAuth(); };
 sb.auth.onAuthStateChange((ev) => { if (ev === "SIGNED_IN" || ev === "SIGNED_OUT") refreshAuth(); });
 
 async function loadPosts() {
-  const { data, error } = await sb.from("news").select("*").order("created_at", { ascending: false });
+  const { data: all, error } = await sb.from("news").select("*").order("publish_at", { ascending: false });
   const box = $("posts");
   if (error) { box.innerHTML = `<p class="empty">Couldn't load posts: ${esc(error.message)}</p>`; return; }
-  if (!data.length) { box.innerHTML = `<p class="empty">No posts yet. The app shows its built-in sample posts until you publish one.</p>`; return; }
+  const n = all.filter(p => stateOf(p) === "review").length;
+  $("filters").querySelector('[data-f=review]').textContent = n ? `To review (${n})` : "To review";
+  const rank = { review: 0, sched: 1, live: 2, hidden: 3 };
+  const data = all.filter(p => filter === "all" || stateOf(p) === filter)
+                  .sort((a, b) => rank[stateOf(a)] - rank[stateOf(b)]);
+  if (!all.length) { box.innerHTML = `<p class="empty">No posts yet. The app shows its built-in sample posts until you publish one.</p>`; return; }
+  if (!data.length) { box.innerHTML = `<p class="empty">Nothing here.</p>`; return; }
+  const pill = { review: `<span class="pill draft">Claude's draft · to review</span>`, hidden: `<span class="pill hidden">Hidden</span>`,
+                 live: `<span class="pill live">In the app</span>` };
   box.innerHTML = data.map(p => `
     <div class="post" data-id="${p.id}">
       ${p.image_url ? `<img class="thumb" src="${esc(p.image_url)}" alt="">` : `<div class="thumb"></div>`}
       <div class="grow">
         <h3>${esc(p.title)}</h3>
         <div class="meta">
-          <span class="pill ${p.published ? "live" : "hidden"}">${p.published ? "In the app" : "Hidden"}</span>
+          ${stateOf(p) === "sched" ? `<span class="pill sched">Goes live ${esc(fmt(p.publish_at))}</span>` : pill[stateOf(p)]}
           ${p.is_test ? `<span class="pill test">TEST</span>` : ""}
-          ${esc(p.tag)} · ${new Date(p.created_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}
+          ${esc(p.tag)} · ${esc(fmt(stateOf(p) === "live" ? p.publish_at : p.created_at))}
           ${p.title_uk ? " · UA" : ""}
         </div>
         <div class="actions">
-          <button class="ghost" data-act="edit">Edit</button>
-          <button class="ghost" data-act="toggle">${p.published ? "Hide from app" : "Show in app"}</button>
+          <button class="${stateOf(p) === "review" ? "primary" : "ghost"}" data-act="edit">${stateOf(p) === "review" ? "Review" : "Edit"}</button>
+          <button class="ghost" data-act="toggle">${p.published ? "Hide from app" : "Show in app now"}</button>
           <button class="danger" data-act="del">Delete</button>
         </div>
       </div>
@@ -216,7 +257,8 @@ async function loadPosts() {
     const p = data.find(x => x.id === el.dataset.id);
     el.querySelector('[data-act=edit]').onclick = () => startEdit(p);
     el.querySelector('[data-act=toggle]').onclick = async () => {
-      const { error } = await sb.from("news").update({ published: !p.published }).eq("id", p.id);
+      const change = p.published ? { published: false } : { published: true, publish_at: new Date().toISOString() };
+      const { error } = await sb.from("news").update(change).eq("id", p.id);
       if (error) return toast(error.message);
       toast(p.published ? "Hidden from the app." : "Showing in the app."); loadPosts();
     };
@@ -238,15 +280,21 @@ function startEdit(p) {
   editingId = p.id; photoUrl = p.image_url; photoFile = null; $("photo").value = "";
   $("tag").value = p.tag; $("title").value = p.title; $("body").value = p.body;
   $("titleUk").value = p.title_uk || ""; $("bodyUk").value = p.body_uk || "";
-  $("published").checked = p.published; $("isTest").checked = p.is_test;
+  $("isTest").checked = p.is_test;
+  const st = stateOf(p); editingState = st;
+  $("when").value = st === "sched" ? "later" : (p.published || st === "review" ? "now" : "hidden");
+  $("at").value = st === "sched" ? toLocalInput(p.publish_at) : ""; syncWhen();
+  $("draftNote").hidden = st !== "review";
   setPhotoPreview(p.image_url);
-  $("edTitle").textContent = "Edit post"; $("save").textContent = "Save changes"; $("cancel").hidden = false;
+  $("edTitle").textContent = st === "review" ? "Review Claude's draft" : "Edit post";
+  $("save").textContent = st === "review" ? "Approve" : "Save changes"; $("cancel").hidden = false;
   $("editor").scrollIntoView({ behavior: "smooth" });
 }
 function resetEditor() {
-  editingId = null; photoUrl = null; photoFile = null; $("photo").value = ""; setPhotoPreview(null);
+  editingId = null; editingState = null; photoUrl = null; photoFile = null; $("photo").value = ""; setPhotoPreview(null);
   for (const id of ["title","body","titleUk","bodyUk"]) $(id).value = "";
-  $("tag").value = "Building"; $("published").checked = true; $("isTest").checked = true;
+  $("tag").value = "Building"; $("isTest").checked = true;
+  $("when").value = "now"; $("at").value = ""; syncWhen(); $("draftNote").hidden = true;
   $("edTitle").textContent = "New post"; $("save").textContent = "Publish"; $("cancel").hidden = true;
 }
 $("cancel").onclick = resetEditor;
@@ -278,13 +326,21 @@ $("save").onclick = async () => {
     const row = {
       tag: $("tag").value, title, body: $("body").value.trim(),
       title_uk: $("titleUk").value.trim() || null, body_uk: $("bodyUk").value.trim() || null,
-      image_url, published: $("published").checked, is_test: $("isTest").checked
+      image_url, is_test: $("isTest").checked
     };
+    const when = $("when").value;
+    if (when === "hidden") row.published = false;
+    else if (when === "now") { row.published = true; if (editingState !== "live") row.publish_at = new Date().toISOString(); }
+    else {
+      if (!$("at").value) throw new Error("Pick the date and time it goes live.");
+      row.published = true; row.publish_at = new Date($("at").value).toISOString();
+    }
     const q = editingId ? sb.from("news").update(row).eq("id", editingId) : sb.from("news").insert(row);
     const { error } = await q;
     if (error) throw new Error(error.message);
-    toast(editingId ? "Saved. Phones pick it up the next time News is opened or pulled down."
-                    : (row.published ? "Published. Phones pick it up the next time News is opened or pulled down." : "Saved as hidden."));
+    toast(when === "hidden" ? "Saved as hidden."
+        : when === "later" ? `Scheduled: it appears in the app ${fmt(row.publish_at)}.`
+        : "Live. Phones pick it up the next time News is opened or pulled down.");
     resetEditor(); loadPosts();
   } catch (e) { toast(e.message); }
   $("save").disabled = false;
